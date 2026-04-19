@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Suivi Production - Scan Multi-Étapes</title>
+    <script src="https://unpkg.com/@zxing/library@latest"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, onSnapshot, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Configuration
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'prod-scanner-app';
+
+        window.db = db;
+        window.appId = appId;
+    </script>
+    <style>
+        .step-active { border-color: #3b82f6; background-color: #eff6ff; color: #1d4ed8; }
+        .step-done { border-color: #10b981; background-color: #ecfdf5; color: #047857; }
+        #video-container { position: relative; width: 100%; max-width: 400px; border-radius: 1rem; overflow: hidden; background: #000; }
+        #video { width: 100%; height: auto; }
+        .scan-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 80%; height: 50%; border: 2px solid #3b82f6; box-shadow: 0 0 0 4000px rgba(0, 0, 0, 0.5); pointer-events: none; }
+        .scan-line { position: absolute; top: 0; left: 0; width: 100%; height: 2px; background: #ef4444; animation: scan 2s linear infinite; }
+        @keyframes scan { 0% { top: 0; } 100% { top: 100%; } }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen pb-20">
+
+    <div class="max-w-4xl mx-auto p-4 space-y-6">
+        <!-- Header -->
+        <header class="flex justify-between items-center bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+            <div>
+                <h1 class="text-xl font-bold text-slate-800">Traçabilité Production</h1>
+                <p id="user-status" class="text-xs text-slate-500 italic">Connexion au cloud...</p>
+            </div>
+            <div id="view-toggle" class="flex bg-slate-100 p-1 rounded-lg">
+                <button onclick="switchTab('scan')" id="tab-scan" class="px-4 py-2 text-sm font-medium rounded-md bg-white shadow-sm">Scanner</button>
+                <button onclick="switchTab('history')" id="tab-history" class="px-4 py-2 text-sm font-medium rounded-md">Historique</button>
+            </div>
+        </header>
+
+        <!-- SECTION SCAN -->
+        <div id="section-scan" class="space-y-6">
+            <!-- Machine Selection -->
+            <section class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h2 class="text-sm font-semibold text-slate-700 mb-4 uppercase tracking-wider">1. Machine</h2>
+                <div class="grid grid-cols-3 md:grid-cols-5 gap-2">
+                    <button onclick="setMachine('LAR2')" class="m-btn p-3 text-sm font-bold border rounded-xl" data-m="LAR2">LAR2</button>
+                    <button onclick="setMachine('LAC2')" class="m-btn p-3 text-sm font-bold border rounded-xl" data-m="LAC2">LAC2</button>
+                    <button onclick="setMachine('LAR3')" class="m-btn p-3 text-sm font-bold border rounded-xl" data-m="LAR3">LAR3</button>
+                    <button onclick="setMachine('LAR5')" class="m-btn p-3 text-sm font-bold border rounded-xl" data-m="LAR5">LAR5</button>
+                    <button onclick="setMachine('LAR6')" class="m-btn p-3 text-sm font-bold border rounded-xl" data-m="LAR6">LAR6</button>
+                </div>
+            </section>
+
+            <!-- Étapes de Scan -->
+            <section class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h2 class="text-sm font-semibold text-slate-700 mb-4 uppercase tracking-wider">2. Flux de Traçabilité</h2>
+                
+                <div class="flex flex-col md:flex-row gap-4 mb-6">
+                    <div id="step1" class="flex-1 p-4 border-2 rounded-xl text-center transition-all">
+                        <span class="block text-xs uppercase font-bold opacity-60">Étape 1</span>
+                        <span class="font-bold">Composant</span>
+                        <p id="val1" class="text-xs mt-1 truncate">-</p>
+                    </div>
+                    <div id="step2" class="flex-1 p-4 border-2 rounded-xl text-center transition-all">
+                        <span class="block text-xs uppercase font-bold opacity-60">Étape 2</span>
+                        <span class="font-bold">Référence</span>
+                        <p id="val2" class="text-xs mt-1 truncate">-</p>
+                    </div>
+                    <div id="step3" class="flex-1 p-4 border-2 rounded-xl text-center transition-all">
+                        <span class="block text-xs uppercase font-bold opacity-60">Étape 3</span>
+                        <span class="font-bold">N° Série</span>
+                        <p id="val3" class="text-xs mt-1 truncate">-</p>
+                    </div>
+                </div>
+
+                <div class="flex flex-col items-center">
+                    <div id="video-container" class="mb-4 hidden">
+                        <video id="video"></video>
+                        <div class="scan-overlay"><div class="scan-line"></div></div>
+                    </div>
+                    
+                    <div id="scan-controls" class="w-full max-w-xs space-y-3">
+                        <button id="btn-action" onclick="toggleCamera()" class="w-full bg-blue-600 text-white py-4 rounded-xl font-bold shadow-lg">
+                            Démarrer le Scan
+                        </button>
+                        <button onclick="resetCurrentFlow()" class="w-full text-slate-400 text-sm hover:text-red-500">Réinitialiser le cycle</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- SECTION HISTORIQUE (CONSULTATION) -->
+        <div id="section-history" class="hidden space-y-6">
+            <section class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <div class="flex flex-wrap gap-4 items-end mb-6">
+                    <div class="flex-1 min-w-[200px]">
+                        <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Filtrer par Date</label>
+                        <input type="date" id="filter-date" onchange="renderHistory()" class="w-full p-2 border rounded-lg">
+                    </div>
+                    <div class="flex-1 min-w-[200px]">
+                        <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Rechercher Composant</label>
+                        <input type="text" id="filter-comp" oninput="renderHistory()" placeholder="Nom..." class="w-full p-2 border rounded-lg">
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr class="text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                                <th class="pb-3">Heure</th>
+                                <th class="pb-3">Machine</th>
+                                <th class="pb-3">Composant</th>
+                                <th class="pb-3">Référence</th>
+                                <th class="pb-3">N° Série</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-rows" class="text-sm divide-y divide-slate-50">
+                            <!-- Data from Firestore -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Notification -->
+    <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-8 py-3 rounded-full opacity-0 transition-opacity z-50 shadow-2xl pointer-events-none"></div>
+
+    <script type="module">
+        import { addDoc, collection, query, onSnapshot, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { signInAnonymously, onAuthStateChanged, getAuth } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        let currentStep = 1; 
+        let scanData = { machine: 'LAR2', component: '', reference: '', serial: '' };
+        let codeReader = null;
+        let isCameraRunning = false;
+        let allLogs = [];
+        let currentUser = null;
+
+        const auth = getAuth();
+
+        window.addEventListener('load', async () => {
+            setMachine('LAR2');
+            updateStepUI();
+
+            // Auth Logic
+            try {
+                await signInAnonymously(auth);
+            } catch (e) {
+                console.error("Auth Error", e);
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                currentUser = user;
+                if (user) {
+                    document.getElementById('user-status').innerText = "Connecté au Cloud (ID: " + user.uid.substring(0,6) + ")";
+                    initFirestoreListener();
+                }
+            });
+        });
+
+        // Navigation
+        window.switchTab = (tab) => {
+            document.getElementById('section-scan').classList.toggle('hidden', tab !== 'scan');
+            document.getElementById('section-history').classList.toggle('hidden', tab !== 'history');
+            document.getElementById('tab-scan').className = tab === 'scan' ? 'px-4 py-2 text-sm font-medium rounded-md bg-white shadow-sm' : 'px-4 py-2 text-sm font-medium rounded-md';
+            document.getElementById('tab-history').className = tab === 'history' ? 'px-4 py-2 text-sm font-medium rounded-md bg-white shadow-sm' : 'px-4 py-2 text-sm font-medium rounded-md';
+            if(isCameraRunning) toggleCamera();
+        };
+
+        // Machine selection
+        window.setMachine = (name) => {
+            scanData.machine = name;
+            document.querySelectorAll('.m-btn').forEach(b => {
+                const isActive = b.dataset.m === name;
+                b.className = `m-btn p-3 text-sm font-bold border rounded-xl transition-all ${isActive ? 'bg-blue-600 text-white border-blue-600 shadow-md scale-105' : 'bg-white text-slate-600 border-slate-200 opacity-60'}`;
+            });
+        };
+
+        // Camera Logic
+        window.toggleCamera = async () => {
+            if (isCameraRunning) {
+                if(codeReader) codeReader.reset();
+                document.getElementById('video-container').classList.add('hidden');
+                document.getElementById('btn-action').innerText = "Démarrer le Scan";
+                document.getElementById('btn-action').className = "w-full bg-blue-600 text-white py-4 rounded-xl font-bold shadow-lg";
+                isCameraRunning = false;
+            } else {
+                codeReader = new ZXing.BrowserMultiFormatReader();
+                document.getElementById('video-container').classList.remove('hidden');
+                document.getElementById('btn-action').innerText = "Arrêter la Caméra";
+                document.getElementById('btn-action').className = "w-full bg-slate-200 text-slate-700 py-4 rounded-xl font-bold";
+                isCameraRunning = true;
+
+                codeReader.decodeFromVideoDevice(undefined, 'video', (result, err) => {
+                    if (result) {
+                        handleScanResult(result.text);
+                    }
+                });
+            }
+        };
+
+        function handleScanResult(text) {
+            if (currentStep === 1) {
+                scanData.component = text;
+                document.getElementById('val1').innerText = text;
+                currentStep = 2;
+                showToast("Composant OK, scannez la Référence");
+            } else if (currentStep === 2) {
+                scanData.reference = text;
+                document.getElementById('val2').innerText = text;
+                currentStep = 3;
+                showToast("Référence OK, scannez le N° de Série");
+            } else if (currentStep === 3) {
+                scanData.serial = text;
+                document.getElementById('val3').innerText = text;
+                saveToCloud();
+            }
+            updateStepUI();
+            if (navigator.vibrate) navigator.vibrate(100);
+        }
+
+        async function saveToCloud() {
+            if (!currentUser) return;
+            try {
+                const collectionRef = collection(window.db, 'artifacts', window.appId, 'public', 'data', 'scans');
+                await addDoc(collectionRef, {
+                    ...scanData,
+                    timestamp: serverTimestamp(),
+                    dateStr: new Date().toISOString().split('T')[0] // Pour filtrage facile
+                });
+                
+                showToast("✅ Cycle terminé et enregistré !");
+                resetCurrentFlow();
+            } catch (e) {
+                console.error(e);
+                showToast("❌ Erreur d'enregistrement cloud");
+            }
+        }
+
+        window.resetCurrentFlow = () => {
+            currentStep = 1;
+            scanData.component = '';
+            scanData.reference = '';
+            scanData.serial = '';
+            document.getElementById('val1').innerText = '-';
+            document.getElementById('val2').innerText = '-';
+            document.getElementById('val3').innerText = '-';
+            updateStepUI();
+        };
+
+        function updateStepUI() {
+            for(let i=1; i<=3; i++) {
+                const el = document.getElementById(`step${i}`);
+                el.className = `flex-1 p-4 border-2 rounded-xl text-center transition-all ${currentStep === i ? 'step-active scale-105 shadow-md' : (currentStep > i ? 'step-done' : 'border-slate-100 opacity-40')}`;
+            }
+        }
+
+        // Firestore Real-time Listener
+        function initFirestoreListener() {
+            const q = query(collection(window.db, 'artifacts', window.appId, 'public', 'data', 'scans'), orderBy('timestamp', 'desc'));
+            onSnapshot(q, (snapshot) => {
+                allLogs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderHistory();
+            }, (err) => console.error("Firestore error", err));
+        }
+
+        window.renderHistory = () => {
+            const dateFilter = document.getElementById('filter-date').value;
+            const compFilter = document.getElementById('filter-comp').value.toLowerCase();
+            const body = document.getElementById('history-rows');
+
+            const filtered = allLogs.filter(item => {
+                const matchDate = dateFilter ? item.dateStr === dateFilter : true;
+                const matchComp = compFilter ? item.component.toLowerCase().includes(compFilter) : true;
+                return matchDate && matchComp;
+            });
+
+            body.innerHTML = filtered.map(item => {
+                const date = item.timestamp ? item.timestamp.toDate() : new Date();
+                const timeStr = date.toLocaleTimeString('fr-FR', {hour:'2-digit', minute:'2-digit'});
+                const dateStr = date.toLocaleDateString('fr-FR');
+                
+                return `
+                    <tr>
+                        <td class="py-3 text-slate-400 font-mono text-xs">${dateStr}<br>${timeStr}</td>
+                        <td class="py-3"><span class="bg-slate-100 px-2 py-1 rounded font-bold text-slate-700 text-xs">${item.machine}</span></td>
+                        <td class="py-3 font-semibold text-slate-800">${item.component}</td>
+                        <td class="py-3 text-blue-600 font-mono text-xs">${item.reference}</td>
+                        <td class="py-3 text-slate-500 font-mono text-xs">${item.serial}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            if(filtered.length === 0) {
+                body.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-slate-400 italic">Aucun résultat trouvé</td></tr>';
+            }
+        };
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.style.opacity = '1';
+            setTimeout(() => t.style.opacity = '0', 3000);
+        }
+    </script>
+</body>
+</html>
